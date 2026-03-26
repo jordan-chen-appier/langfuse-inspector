@@ -2,6 +2,8 @@
 #
 # langfuse-inspector - Langfuse CLI for fetching traces, observations, and sessions
 #
+# Dependencies: curl, jq
+#
 # Usage:
 #   source this file or call with parameters
 #
@@ -28,6 +30,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/.env" ]]; then
     source "${SCRIPT_DIR}/.env"
 fi
+
+# Check dependencies
+for cmd in curl jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: '$cmd' is required but not installed." >&2
+        exit 1
+    fi
+done
 
 # Default values
 LANGFUSE_HOST="${LANGFUSE_HOST:-https://langfuse.appier.net}"
@@ -199,20 +209,65 @@ validate_credentials() {
     fi
 }
 
-# URL-encode a string (special chars like [], spaces)
+# URL-encode a string (RFC 3986, pure shell, no python dependency)
 url_encode() {
-    python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+    local LC_ALL=C
+    local string="$1" i byte
+    local hex_string
+    hex_string=$(printf '%s' "$string" | od -An -tx1 | tr -d ' \n')
+    for (( i = 0; i < ${#hex_string}; i += 2 )); do
+        byte="${hex_string:i:2}"
+        case "$byte" in
+            4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a]) printf "\\x${byte}" ;;  # A-Z a-z
+            3[0-9]) printf "\\x${byte}" ;;                                  # 0-9
+            2d|2e|5f|7e) printf "\\x${byte}" ;;                             # - . _ ~
+            *) printf '%%%s' "${byte^^}" ;;
+        esac
+    done
+}
+
+# Convert ISO 8601 UTC timestamp to UTC+8 display string
+# Input: "2024-01-15T10:30:00.000Z" or "2024-01-15T10:30:00+00:00"
+# Output: "2024-01-15 18:30:00"
+utc_to_local() {
+    local ts="$1"
+    # Strip fractional seconds and normalize Z to +00:00
+    ts="${ts%%.*}"
+    ts="${ts%Z}"
+    ts="${ts%+00:00}"
+    if date --version &>/dev/null 2>&1; then
+        # GNU date (Linux)
+        date -d "${ts}Z +8 hours" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$1"
+    else
+        # BSD date (macOS)
+        local epoch
+        epoch=$(date -j -f '%Y-%m-%dT%H:%M:%S' "$ts" '+%s' 2>/dev/null) || { echo "$1"; return; }
+        epoch=$(( epoch + 28800 ))
+        date -j -f '%s' "$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$1"
+    fi
+}
+
+# Format milliseconds to human-readable latency
+format_latency() {
+    local ms="$1"
+    if [[ "$ms" -ge 60000 ]]; then
+        echo "$(echo "scale=1; $ms / 60000" | bc)m"
+    elif [[ "$ms" -ge 1000 ]]; then
+        echo "$(echo "scale=1; $ms / 1000" | bc)s"
+    else
+        echo "${ms}ms"
+    fi
 }
 
 # Make API request
 api_get() {
     local path="$1"
     local url="${LANGFUSE_HOST}${path}"
-    
+
     if [[ "$VERBOSE" == "true" ]]; then
         echo -e "${BLUE}[DEBUG] GET $url${NC}" >&2
     fi
-    
+
     curl -s -u "${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}" "$url"
 }
 
@@ -222,14 +277,14 @@ get_session_info() {
         echo -e "${RED}Error: --session-id is required for --session-info${NC}"
         exit 1
     fi
-    
+
     local response
     response=$(api_get "/api/public/sessions/${SESSION_ID}")
-    
+
     if [[ "$OUTPUT_JSON" == "true" ]]; then
         echo "$response"
     else
-        echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
+        echo "$response" | jq . 2>/dev/null || echo "$response"
     fi
 }
 
@@ -239,24 +294,11 @@ list_trace_ids() {
         echo -e "${RED}Error: --session-id is required${NC}"
         exit 1
     fi
-    
+
     local response
     response=$(api_get "/api/public/traces?sessionId=${SESSION_ID}&limit=${LIMIT}&page=${PAGE}")
-    
-    # Parse and sort traces by timestamp, output only IDs
-    echo "$response" | python3 -c "
-import sys, json
-from datetime import datetime
 
-data = json.load(sys.stdin)
-traces = data.get('data', [])
-
-# Sort by timestamp
-traces_sorted = sorted(traces, key=lambda t: t.get('timestamp', ''))
-
-for t in traces_sorted:
-    print(t.get('id', ''))
-" 2>/dev/null || echo "$response"
+    echo "$response" | jq -r '.data | sort_by(.timestamp) | .[].id' 2>/dev/null || echo "$response"
 }
 
 # List traces in session
@@ -265,90 +307,54 @@ list_traces() {
         echo -e "${RED}Error: --session-id is required${NC}"
         exit 1
     fi
-    
+
     local response
     response=$(api_get "/api/public/traces?sessionId=${SESSION_ID}&limit=${LIMIT}&page=${PAGE}")
-    
-    # Parse and format traces
+
     if [[ "$OUTPUT_JSON" == "true" ]]; then
         echo "$response"
         return
     fi
-    
-    # Get data array
+
+    # Extract traces, apply head/tail
     local traces
-    traces=$(echo "$response" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-traces = data.get('data', [])
-print(json.dumps(traces))
-" 2>/dev/null) || traces="[]"
-    
-    # Apply head/tail
+    traces=$(echo "$response" | jq '.data // []') || traces="[]"
+
     if [[ "$HEAD_COUNT" -gt 0 ]]; then
-        traces=$(echo "$traces" | python3 -c "
-import sys, json
-traces = json.load(sys.stdin)
-print(json.dumps(traces[:${HEAD_COUNT}]))
-" 2>/dev/null) || traces="[]"
+        traces=$(echo "$traces" | jq ".[0:${HEAD_COUNT}]")
     elif [[ "$TAIL_COUNT" -gt 0 ]]; then
-        traces=$(echo "$traces" | python3 -c "
-import sys, json
-traces = json.load(sys.stdin)
-print(json.dumps(traces[-${TAIL_COUNT}:]))
-" 2>/dev/null) || traces="[]"
+        traces=$(echo "$traces" | jq ".[-${TAIL_COUNT}:]")
     fi
-    
-    # Display traces
-    echo "$traces" | python3 -c "
-import sys, json
-from datetime import datetime, timedelta, timezone
 
-traces = json.load(sys.stdin)
-print(f'=== Session traces ({len(traces)} traces) ===\n')
+    local count
+    count=$(echo "$traces" | jq 'length')
+    echo "=== Session traces (${count} traces) ==="
+    echo ""
 
-# Calculate offset for pagination
-offset = (${PAGE} - 1) * ${LIMIT}
+    local offset=$(( (PAGE - 1) * LIMIT ))
+    local i=0
 
-for i, t in enumerate(traces):
-    tid = t.get('id', '')
-    ts = t.get('timestamp', '')
-    name = t.get('name', '')
-    input_val = t.get('input', '')
-    output_val = t.get('output', '')
-    
-    # Format timestamp (convert UTC to local UTC+8)
-    try:
-        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-        local_dt = dt.astimezone(timezone(timedelta(hours=8)))
-        ts = local_dt.strftime('%Y-%m-%d %H:%M:%S')
-    except:
-        pass
-    
-    # Format input/output for display
-    if isinstance(input_val, str):
-        input_val = input_val.replace('\n', ' ')
-    elif input_val:
-        input_val = str(input_val).replace('\n', ' ')
-    else:
-        input_val = ''
-    
-    if isinstance(output_val, str):
-        output_val = output_val.replace('\n', ' ')
-    elif output_val:
-        output_val = str(output_val).replace('\n', ' ')
-    else:
-        output_val = ''
-    
-    print(f'Turn {offset+i+1}: {tid}')
-    print(f'  Name: {name}')
-    print(f'  Time: {ts}')
-    if input_val:
-        print(f'  Input: {input_val}')
-    if output_val:
-        print(f'  Output: {output_val}')
-    print()
-" 2>/dev/null || echo "$traces"
+    while IFS= read -r trace; do
+        local tid name ts input_val output_val
+        tid=$(echo "$trace" | jq -r '.id // ""')
+        name=$(echo "$trace" | jq -r '.name // ""')
+        ts=$(echo "$trace" | jq -r '.timestamp // ""')
+        input_val=$(echo "$trace" | jq -r 'if .input == null then "" elif (.input | type) == "string" then .input | gsub("\n"; " ") else (.input | tostring) | gsub("\n"; " ") end')
+        output_val=$(echo "$trace" | jq -r 'if .output == null then "" elif (.output | type) == "string" then .output | gsub("\n"; " ") else (.output | tostring) | gsub("\n"; " ") end')
+
+        if [[ -n "$ts" ]]; then
+            ts=$(utc_to_local "$ts")
+        fi
+
+        echo "Turn $(( offset + i + 1 )): ${tid}"
+        echo "  Name: ${name}"
+        echo "  Time: ${ts}"
+        [[ -n "$input_val" ]] && echo "  Input: ${input_val}"
+        [[ -n "$output_val" ]] && echo "  Output: ${output_val}"
+        echo ""
+
+        i=$(( i + 1 ))
+    done < <(echo "$traces" | jq -c '.[]')
 }
 
 # Get single trace details
@@ -357,16 +363,16 @@ get_trace() {
         echo -e "${RED}Error: --trace-id is required${NC}"
         exit 1
     fi
-    
+
     local response
     response=$(api_get "/api/public/traces/${TRACE_ID}")
-    
+
     if [[ "$OUTPUT_JSON" == "true" ]]; then
         echo "$response"
         return
     fi
-    
-    echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
+
+    echo "$response" | jq . 2>/dev/null || echo "$response"
 }
 
 # List observations for a trace
@@ -375,65 +381,53 @@ list_observations() {
         echo -e "${RED}Error: --trace-id is required${NC}"
         exit 1
     fi
-    
+
     local response
     response=$(api_get "/api/public/observations?traceId=${TRACE_ID}&limit=100")
-    
+
     if [[ "$OUTPUT_JSON" == "true" ]]; then
         echo "$response"
         return
     fi
-    
-    # Extract and display unique observation names with timing
-    echo "$response" | python3 -c "
-import sys, json
-from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
 
-data = json.load(sys.stdin)
-observations = data.get('data', [])
+    # Use jq to sort, group, and format observations
+    echo "$response" | jq -r '
+        .data // [] | sort_by(.startTime) as $sorted |
+        ($sorted | length) as $total |
+        ($sorted | [.[].name // empty] | unique | length) as $unique_count |
 
-# Sort by startTime ascending (execution order)
-observations.sort(key=lambda o: o.get('startTime', ''))
+        "=== Observations for trace ===\n",
+        "Total observations: \($total)",
+        "Unique names: \($unique_count)\n",
 
-# Get unique names preserving execution order
-names = list(OrderedDict.fromkeys(o.get('name', '') for o in observations if o.get('name')))
+        # Group by name preserving execution order
+        (reduce $sorted[] as $o (
+            {seen: {}, names: []};
+            if .seen[$o.name] then . else .seen[$o.name] = true | .names += [$o.name] end
+        ) | .names[]) as $name |
 
-print('=== Observations for trace ===\n')
-print(f'Total observations: {len(observations)}')
-print(f'Unique names: {len(names)}\n')
+        ($sorted | [.[] | select(.name == $name)]) as $matched |
+        ($matched | length) as $count |
+        ($matched[0].type // "") as $obs_type |
+        ($matched | map(.latency // 0) | add) as $total_ms |
+        ($matched[0].startTime // "") as $start_time |
 
-for name in names:
-    matched = [o for o in observations if o.get('name') == name]
-    count = len(matched)
-    obs_type = matched[0].get('type', '')
-    
-    # Calculate total latency across all instances (API returns ms)
-    total_ms = sum(o.get('latency', 0) or 0 for o in matched)
-    
-    # Format latency (ms → human readable)
-    if total_ms >= 60000:
-        latency_str = f'{total_ms/60000:.1f}m'
-    elif total_ms >= 1000:
-        latency_str = f'{total_ms/1000:.1f}s'
-    else:
-        latency_str = f'{total_ms:.0f}ms'
-    
-    # Time range (convert UTC to local UTC+8)
-    try:
-        utc_dt = datetime.fromisoformat(matched[0].get('startTime', '').replace('Z', '+00:00'))
-        local_dt = utc_dt.astimezone(timezone(timedelta(hours=8)))
-        first_start = local_dt.strftime('%Y-%m-%d %H:%M:%S')
-    except:
-        first_start = matched[0].get('startTime', '')[:19].replace('T', ' ')
-    
-    if count == 1:
-        print(f'  {name}')
-        print(f'    Type: {obs_type} | Latency: {latency_str} | Start: {first_start}')
-    else:
-        print(f'  {name}')
-        print(f'    Type: {obs_type} | Count: {count} | Total: {latency_str} | First: {first_start}')
-" 2>/dev/null || echo "$response"
+        # Format latency
+        (if $total_ms >= 60000 then "\($total_ms / 60000 * 10 | round / 10)m"
+         elif $total_ms >= 1000 then "\($total_ms / 1000 * 10 | round / 10)s"
+         else "\($total_ms)ms"
+         end) as $latency_str |
+
+        # Format start time (strip fractional seconds for display)
+        ($start_time | split(".")[0] | gsub("T"; " ") | gsub("Z"; "")) as $time_display |
+
+        "  \($name)",
+        if $count == 1 then
+            "    Type: \($obs_type) | Latency: \($latency_str) | Start: \($time_display)"
+        else
+            "    Type: \($obs_type) | Count: \($count) | Total: \($latency_str) | First: \($time_display)"
+        end
+    ' 2>/dev/null || echo "$response"
 }
 
 # Get specific observation
@@ -446,75 +440,86 @@ get_observation() {
         echo -e "${RED}Error: --observation NAME is required${NC}"
         exit 1
     fi
-    
+
     local response
     local encoded_name=$(url_encode "$OBSERVATION")
     response=$(api_get "/api/public/observations?traceId=${TRACE_ID}&name=${encoded_name}&limit=100")
-    
+
     if [[ "$OUTPUT_JSON" == "true" ]]; then
         echo "$response"
         return
     fi
-    
-    echo "$response" | python3 -c "
-import sys, json
 
-data = json.load(sys.stdin)
-obs_list = data.get('data', [])
+    local obs_count
+    obs_count=$(echo "$response" | jq '.data | length' 2>/dev/null) || obs_count=0
 
-if not obs_list:
-    print(f'Observation \"${OBSERVATION}\" not found')
-    sys.exit(1)
+    if [[ "$obs_count" -eq 0 ]]; then
+        echo "Observation \"${OBSERVATION}\" not found"
+        return 1
+    fi
 
-for idx, obs in enumerate(obs_list):
-    if idx > 0:
-        print('\n' + '='*60 + '\n')
-    label = f'{obs.get(\"name\", \"Observation\")}' if len(obs_list) == 1 else f'{obs.get(\"name\", \"Observation\")} [{idx+1}/{len(obs_list)}]'
-    print(f'=== {label} ===')
-    print(f'ID: {obs.get(\"id\", \"\")}')
-    print(f'Type: {obs.get(\"type\", \"\")}')
-    print(f'Start: {obs.get(\"startTime\", \"\")}')
-    print(f'End: {obs.get(\"endTime\", \"\")}')
+    local i=0
+    while IFS= read -r obs; do
+        if [[ "$i" -gt 0 ]]; then
+            echo ""
+            printf '=%.0s' {1..60}
+            echo ""
+            echo ""
+        fi
 
-    # Input
-    inp = obs.get('input')
-    if inp is not None:
-        print('\n--- Input ---')
-        if isinstance(inp, (dict, list)):
-            print(json.dumps(inp, indent=2, ensure_ascii=False))
-        else:
-            print(str(inp))
+        local name obs_id obs_type start_time end_time
+        name=$(echo "$obs" | jq -r '.name // "Observation"')
+        obs_id=$(echo "$obs" | jq -r '.id // ""')
+        obs_type=$(echo "$obs" | jq -r '.type // ""')
+        start_time=$(echo "$obs" | jq -r '.startTime // ""')
+        end_time=$(echo "$obs" | jq -r '.endTime // ""')
 
-    # Output
-    out = obs.get('output')
-    if out is not None:
-        print('\n--- Output ---')
-        if isinstance(out, (dict, list)):
-            print(json.dumps(out, indent=2, ensure_ascii=False))
-        else:
-            print(str(out))
+        if [[ "$obs_count" -eq 1 ]]; then
+            echo "=== ${name} ==="
+        else
+            echo "=== ${name} [$(( i + 1 ))/${obs_count}] ==="
+        fi
+        echo "ID: ${obs_id}"
+        echo "Type: ${obs_type}"
+        echo "Start: ${start_time}"
+        echo "End: ${end_time}"
 
-    # Metadata
-    meta = obs.get('metadata')
-    if meta:
-        print('\n--- Metadata ---')
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except:
-                pass
-        if isinstance(meta, (dict, list)):
-            print(json.dumps(meta, indent=2, ensure_ascii=False))
-        else:
-            print(meta)
-" 2>/dev/null || echo "$response"
+        # Input
+        local has_input
+        has_input=$(echo "$obs" | jq '.input != null')
+        if [[ "$has_input" == "true" ]]; then
+            echo ""
+            echo "--- Input ---"
+            echo "$obs" | jq -r 'if (.input | type) == "string" then .input else (.input | tojson) end' | jq . 2>/dev/null || echo "$obs" | jq -r '.input | tostring'
+        fi
+
+        # Output
+        local has_output
+        has_output=$(echo "$obs" | jq '.output != null')
+        if [[ "$has_output" == "true" ]]; then
+            echo ""
+            echo "--- Output ---"
+            echo "$obs" | jq -r 'if (.output | type) == "string" then .output else (.output | tojson) end' | jq . 2>/dev/null || echo "$obs" | jq -r '.output | tostring'
+        fi
+
+        # Metadata
+        local has_meta
+        has_meta=$(echo "$obs" | jq '.metadata != null and .metadata != {} and .metadata != ""')
+        if [[ "$has_meta" == "true" ]]; then
+            echo ""
+            echo "--- Metadata ---"
+            echo "$obs" | jq '.metadata' 2>/dev/null
+        fi
+
+        i=$(( i + 1 ))
+    done < <(echo "$response" | jq -c '.data[]')
 }
 
 # Main execution
 main() {
     parse_args "$@"
     validate_credentials
-    
+
     # Route to appropriate function
     if [[ "$SESSION_INFO" == "true" ]]; then
         get_session_info
