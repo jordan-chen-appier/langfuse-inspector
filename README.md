@@ -5,7 +5,7 @@ Langfuse CLI for fetching traces, observations, and sessions.
 ## Installation
 
 ```bash
-cd /Users/jordanchen/Workspace/Appier/langfuse-inspector
+cd langfuse-inspector
 chmod +x langfuse-inspector.sh
 ```
 
@@ -14,7 +14,7 @@ chmod +x langfuse-inspector.sh
 `langfuse-inspector.sh` automatically loads credentials from `.env` in the same directory.
 
 ```bash
-# /Users/jordanchen/Workspace/Appier/langfuse-inspector/.env
+# .env
 LANGFUSE_HOST="https://langfuse.appier.net"
 LANGFUSE_PUBLIC_KEY="pk-lf-..."
 LANGFUSE_SECRET_KEY="sk-lf-..."
